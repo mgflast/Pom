@@ -24,8 +24,6 @@ setup(
     install_requires=[
         "matplotlib",
         "pandas",
-        "streamlit>=1.50.0",
-        "streamlit-aggrid",
         "starfile",
         "tqdm",
         "mrcfile",

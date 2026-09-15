@@ -228,11 +228,52 @@ def collect_tomogram_names(config):
 
 def describe_tomogram_count(n_unique, n_files, max_flavours):
     """Human-readable count that distinguishes unique tomograms from flavour volumes.
-    Only mentions flavours when tomogram names actually overlap across sources
-    (n_files > n_unique); otherwise reports the plain tomogram count."""
+    Only mentions the file count when tomogram names actually overlap across sources
+    (n_files > n_unique); which sources overlap is spelled out by
+    `describe_name_collisions`, so this stays a plain count."""
     if n_files == n_unique:
         return f"{n_unique} tomograms"
-    return f"{n_unique} tomograms ({n_files} volume files, up to {max_flavours} flavours each)"
+    return f"{n_unique} tomograms ({n_files} volume files)"
+
+def _source_display_labels(sources):
+    """Short but unambiguous labels for tomogram sources in CLI messages: the directory
+    basename where that is unique, the full configured path where it is not."""
+    bases = [os.path.basename(os.path.normpath(s)) for s in sources]
+    return {s: (b if bases.count(b) == 1 else s) for b, s in zip(bases, sources)}
+
+def _join_labels(labels):
+    """'A', 'A and B', 'A, B and C'."""
+    if len(labels) == 1:
+        return labels[0]
+    return f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+def describe_name_collisions(config):
+    """Spell out which tomogram names appear in more than one source. Pom treats a repeated
+    name as one tomogram with several flavours (raw vs. denoised of the same thing) rather
+    than as separate tomograms, so it is worth stating that assumption out loud - a collision
+    the user did not intend means two different tomograms are being merged. Returns one line
+    per group of sources that overlap, or [] when every source contributes distinct names."""
+    sources = config['tomogram_sources']
+    where = {}
+    for src in sources:
+        for t in glob.glob(os.path.join(src, '*.mrc')):
+            name = str(os.path.splitext(os.path.basename(t))[0])
+            where.setdefault(name, []).append(src)
+
+    groups = {}
+    for srcs in where.values():
+        if len(srcs) > 1:
+            groups[tuple(srcs)] = groups.get(tuple(srcs), 0) + 1
+
+    labels = _source_display_labels(sources)
+    lines = []
+    for srcs, n in sorted(groups.items(), key=lambda kv: (-kv[1], kv[0])):
+        named = _join_labels([f"'{labels[s]}'" for s in srcs])
+        where_txt = f"both {named}" if len(srcs) == 2 else f"all of {named}"
+        noun = "tomogram name" if n == 1 else "tomogram names"
+        lines.append(f"Name collisions: {n} {noun} in {where_txt}. "
+                     f"Assuming these are the same tomograms in different versions.")
+    return lines
 
 def source_subset_name(src):
     """Derive a subset name for a tomogram source directory. The name starts at the first
@@ -252,15 +293,28 @@ def source_subset_name(src):
 def create_source_subsets(config):
     """When multiple tomogram sources are configured, (re)generate one subset per source
     directory, named via `source_subset_name` and listing that directory's tomograms.
-    No-op for a single source. Returns a list of (subset_name, n_tomograms) created."""
+    No-op for a single source. Returns a list of (subset_name, n_tomograms) created.
+
+    Subsets are how the app filters by source: `pom projections` pools tomograms from every
+    source into one 'density' dir (see `density_projection_targets`), so the flavour selector
+    no longer separates disjoint sources - selecting the source's subset does."""
     sources = config['tomogram_sources']
     if len(sources) < 2:
         return []
     subsets_dir = os.path.join('pom', 'subsets')
     os.makedirs(subsets_dir, exist_ok=True)
     created = []
+    used = set()
     for src in sources:
         name = source_subset_name(src)
+        # Two sources can derive the same label (e.g. .../001_HELA/denoised under different
+        # parents); suffix rather than let the second silently overwrite the first.
+        if name in used:
+            n = 2
+            while f'{name}_{n}' in used:
+                n += 1
+            name = f'{name}_{n}'
+        used.add(name)
         paths = sorted(glob.glob(os.path.join(src, '*.mrc')))
         if not paths:
             continue
@@ -283,11 +337,13 @@ def list_sources():
         print(f"  {n}. {src} - {n_mrc} .mrc files")
         n += 1
     if len(config['tomogram_sources']) > 1:
-        tomo_names, n_files, max_flavours = collect_tomogram_names(config)
-        if n_files == len(tomo_names):
-            print(f"  -> {len(tomo_names)} unique tomograms, {n_files} volume files (no flavour overlap)")
-        else:
-            print(f"  -> {len(tomo_names)} unique tomograms, {n_files} volume files (up to {max_flavours} flavours each)")
+        tomo_names, n_files, _ = collect_tomogram_names(config)
+        print(f"  -> {len(tomo_names)} unique tomograms, {n_files} volume files")
+        collisions = describe_name_collisions(config)
+        for line in collisions:
+            print(f"  -> {line}")
+        if not collisions:
+            print("  -> No name collisions: every source contributes different tomograms.")
 
     print("\nSegmentation sources:")
     if not config['segmentation_sources']:
@@ -412,6 +468,8 @@ def summarize(overwrite=True, target_feature=None):
             total_segmentations += len(glob.glob(pattern))
 
     print(f"Found {describe_tomogram_count(len(tomo_names), n_files, max_flavours)}, {total_segmentations} segmentation volumes.")
+    for line in describe_name_collisions(config):
+        print(line)
 
     if not os.path.exists(summary_path) or overwrite:
         df = pd.DataFrame(index=tomo_names)
@@ -420,11 +478,10 @@ def summarize(overwrite=True, target_feature=None):
         df = starfile.read(summary_path, parse_as_string=["tomogram"])
         df = df.set_index('tomogram')
         df.index = df.index.astype(str)
-        current_names = set(tomo_names)
-        df = df[df.index.isin(current_names)] # remove entries from now-missing sources or tomograms
-        for name in tomo_names:
-            if name not in df.index:
-                df.loc[name] = np.nan
+        # Drop entries from now-missing sources/tomograms and add rows for new ones.
+        # reindex handles both, and (unlike df.loc[name] = np.nan) works even when
+        # df has no feature columns yet (e.g. no segmentations summarized so far).
+        df = df.reindex(tomo_names)
 
     tasks = []
     feature_key = "*" if target_feature is None else f'{target_feature}'
@@ -433,7 +490,10 @@ def summarize(overwrite=True, target_feature=None):
         for src in config['segmentation_sources']:
             pattern = os.path.join(src, f'{tomo_name}__{feature_key}.mrc')
             for seg_path in glob.glob(pattern):
-                feature_name = os.path.splitext(os.path.basename(seg_path))[0].split('__', 1)[1]
+                # Split on the LAST '__': tomogram names may themselves contain '__'
+                # (e.g. 065_MIM029_3__lam9_ts_009_10.00Apx), while a feature is a single
+                # label, so the feature is always the final '__'-delimited segment.
+                feature_name = os.path.splitext(os.path.basename(seg_path))[0].rsplit('__', 1)[1]
                 segmentations[feature_name] = seg_path
 
         if len(segmentations) == 0:
@@ -553,10 +613,13 @@ def _sanitize_source_label(name):
     return label or 'src'
 
 def density_dirnames(sources):
-    """Map each tomogram source to the image subdir holding its central-slice ('density')
-    images. The first source is the main one and keeps the bare name 'density'; every
-    additional source becomes 'density_<sanitized basename>', de-duplicated with a numeric
-    suffix when two sources share a basename. Returns a list parallel to `sources`."""
+    """Allocate the *flavour* image subdir name of each tomogram source, i.e. the directory
+    a source uses for tomograms whose name an earlier source already claimed. The first
+    source keeps the bare name 'density' (it wins every name it holds, so it never actually
+    needs a flavour dir); every additional source becomes 'density_<sanitized basename>',
+    de-duplicated with a numeric suffix when two sources share a basename. Returns a list
+    parallel to `sources`. This is only a name allocator: which directory a given image ends
+    up in is decided per (source, tomogram) by `density_projection_targets`."""
     names = []
     used = set()
     for i, src in enumerate(sources):
@@ -573,6 +636,27 @@ def density_dirnames(sources):
         used.add(name)
         names.append(name)
     return names
+
+def density_projection_targets(sources):
+    """Route every tomogram file to the image subdir its central-slice projection belongs in.
+    A tomogram's identity is its filename, and `collect_tomogram_names` pools those names
+    across all sources, so the images must be pooled the same way: the *first* source holding
+    a given name owns it and writes into the base 'density' dir. Only a name an earlier source
+    already claimed is a genuine flavour (e.g. raw vs. denoised of the same tomogram) and goes
+    into that source's own 'density_<name>' dir. A source contributing names nobody else has
+    simply adds more tomograms to 'density'. Returns a list of (tomogram_path, tomogram_name,
+    subdir), in config source order."""
+    flavours = density_dirnames(sources)
+    claimed = set()
+    targets = []
+    for src, flavour in zip(sources, flavours):
+        names_here = []
+        for tomo_path in sorted(glob.glob(os.path.join(src, '*.mrc'))):
+            name = str(os.path.splitext(os.path.basename(tomo_path))[0])
+            names_here.append(name)
+            targets.append((tomo_path, name, flavour if name in claimed else 'density'))
+        claimed.update(names_here)
+    return targets
 
 def _process_projection(args):
     from PIL import Image
@@ -610,20 +694,17 @@ def projections(overwrite=False):
 
     tasks = []
 
-    density_dirs = density_dirnames(config['tomogram_sources'])
-    for src, subdir in zip(config['tomogram_sources'], density_dirs):
-        for tomo_path in glob.glob(os.path.join(src, '*.mrc')):
-            tomo_name = os.path.splitext(os.path.basename(tomo_path))[0]
-            output_path = os.path.join('pom', 'images', subdir, f'{tomo_name}.png')
-            if overwrite or not os.path.exists(output_path):
-                tasks.append((tomo_path, output_path, True))
+    for tomo_path, tomo_name, subdir in density_projection_targets(config['tomogram_sources']):
+        output_path = os.path.join('pom', 'images', subdir, f'{tomo_name}.png')
+        if overwrite or not os.path.exists(output_path):
+            tasks.append((tomo_path, output_path, True))
 
     for src in config['segmentation_sources']:
         for seg_path in glob.glob(os.path.join(src, '*__*.mrc')):
             if _is_placeholder(seg_path):
                 continue
             seg_filename = os.path.splitext(os.path.basename(seg_path))[0]
-            tomo_name, feature_name = seg_filename.split('__', 1)
+            tomo_name, feature_name = seg_filename.rsplit('__', 1)  # feature is after the last '__'
             output_path = os.path.join('pom', 'images', f'{feature_name}_projection', f'{tomo_name}.png')
             if overwrite or not os.path.exists(output_path):
                 tasks.append((seg_path, output_path, False))
@@ -1076,7 +1157,7 @@ def create_mask(name, samplers, output_dir=None, dust=0.0, subset=None, workers=
         # Also include any tomograms that only show up in segmentation sources.
         for src in config['segmentation_sources']:
             for p in glob.glob(os.path.join(src, '*__*.mrc')):
-                tomos.add(os.path.basename(p).split('__', 1)[0])
+                tomos.add(os.path.splitext(os.path.basename(p))[0].rsplit('__', 1)[0])  # strip the last '__<feature>'
         tomograms = sorted(tomos)
 
     if not tomograms:

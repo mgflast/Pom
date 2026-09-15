@@ -16,11 +16,20 @@ st.set_page_config(
 
 os.makedirs(os.path.join("pom", "subsets"), exist_ok=True)
 
-def create_subset():
+def create_subset(tomo_name):
+    """Create a subset from the text box and put the tomogram being viewed in it."""
     name = st.session_state.new_subset_name.strip()
     if not name:
         return
     add_to_subset(name, tomo_name)
+    # The "Include in tomogram subsets" multiselect is keyed per tomogram, and for a key that
+    # already exists Streamlit's stored widget state wins over the freshly computed `default`.
+    # Without seeding it here the new subset reads back as unselected on the next rerun, and
+    # the reconciliation below would immediately remove the tomogram we just added.
+    key = f'subset_select_{tomo_name}'
+    if key in st.session_state and name not in st.session_state[key]:
+        st.session_state[key] = list(st.session_state[key]) + [name]
+    st.session_state.new_subset_name = ""
 
 df = load_data()
 
@@ -137,7 +146,8 @@ with column_base:
             "Create new subset",
             key="new_subset_name",
             placeholder="Subset name",
-            on_change=create_subset
+            on_change=create_subset,
+            args=(tomo_name,)
         )
 
     cols = st.columns([1, 1])

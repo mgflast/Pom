@@ -524,7 +524,7 @@ class Camera3D:
         self.projection_matrix = np.eye(4)
         self.view_projection_matrix = np.eye(4)
         self.focus = np.zeros(3)
-        self.pitch = -15.0
+        self.pitch = 0.0
         self.yaw = 180.0
         self.distance = 1120.0
         self.clip_near = 1e2
