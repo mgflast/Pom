@@ -8,6 +8,17 @@ import os
 # TODO: add global context values to the particle subset thing.
 # TODO: add lamella images to the browse tomograms thing.
 
+def browse():
+    import subprocess
+    app_path = os.path.join(os.path.dirname(__file__), 'app', 'Introduction.py')
+    try:
+        ok = subprocess.run(['streamlit', 'run', app_path, '--server.headless=true']).returncode == 0
+    except FileNotFoundError:
+        ok = False
+    if not ok:
+        print("'pom browse' could not start - see https://mgflast.github.io/easymode/user_guide/pom/installation/")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pom-cryoET")
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -96,18 +107,12 @@ def main():
             exit()
         tools.contextualize_starfile(args.starfile, args.samplers, tomogram_name=args.tomo_column, substitutions=args.substitutions, out_star=args.out_star, coords_angpix=args.apix, binning=args.binning, workers=args.workers)
     elif args.command == 'browse':
-        import subprocess
-        app_path = os.path.join(os.path.dirname(__file__), 'app', 'Introduction.py')
-        print(f'streamlit run {app_path} --server.headless=true')
-        subprocess.run(['streamlit', 'run', app_path, '--server.headless=true'])
+        browse()
     elif args.command == 'auto':
         tools.summarize(overwrite=False)
         tools.projections(overwrite=False)
         tools.render(overwrite=False)
-        import subprocess
-        app_path = os.path.join(os.path.dirname(__file__), 'app', 'Introduction.py')
-        print(f'streamlit run {app_path} --server.headless=true')
-        subprocess.run(['streamlit', 'run', app_path, '--server.headless=true'])
+        browse()
 
 
 
