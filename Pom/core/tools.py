@@ -79,9 +79,9 @@ def add_feature_to_library(feature):
 
     save_feature_library(feature_library)
 
-# Render resolutions (px) for static PNG vs spin GIF. PNGs render full-size for the
-# detail page / gallery; spin GIFs render smaller since they're shown smaller and need
-# to encode 180 frames cheaply.
+# Output resolutions (px, long side) for static PNG vs spin GIF. GIF frames are rendered at the
+# PNG size and scaled down: rendered directly at 512 px, the fixed-width silhouettes come out
+# twice as thick and the edges jagged.
 RENDER_IMAGE_SIZE = 1024
 SPIN_RENDER_SIZE = 512
 
@@ -91,7 +91,11 @@ SPIN_FPS = 10  # ~100 ms per frame, ~18 s full rotation (3x smoother than 60 fra
 # For spin movies, bin isosurface segmentations so that their largest axis is at most this many
 # voxels. Triangle count (and per-frame draw cost) scales with surface area ~ axis^2, so capping
 # the largest axis bounds the worst-case mesh size regardless of tomogram aspect ratio.
-SPIN_SURFACE_MAX_AXIS = 256
+# Matches SPIN_RENDER_SIZE, so a voxel covers about one pixel of the GIF.
+SPIN_SURFACE_MAX_AXIS = 512
+# Same for the static PNG: a 1024 px image cannot show full-res voxels of a ~1000 px tomogram,
+# and filtering + meshing the unbinned volume takes minutes.
+RENDER_SURFACE_MAX_AXIS = 512
 
 
 def composition_features(comp):
@@ -682,7 +686,7 @@ def _process_projection(args):
 
         img = Image.fromarray(slice_data, mode='L')
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        img.save(output_path)
+        _save_image(img, output_path)
 
         return True
     except:
@@ -747,6 +751,7 @@ def _bin_surface_volume(data, bin_factor):
         data = data.astype(np.float32) / 255.0
     else:
         data = data.astype(np.float32)
+        data[data == 2] = 0  # same easymode hack as in SurfaceModel, which would otherwise run after pooling
     return _bin_volume(data, bin_factor).astype(np.float32)
 
 
@@ -796,60 +801,90 @@ def _build_renderables(features_to_render, tomo_name, config, feature_library, s
     return renderables
 
 
-def _render_worker(tomo_names, df, config, feature_library, compositions, overwrite, counter, lock):
-    """Worker process that creates ONE renderer and processes all assigned tomograms."""
-    from Pom.core.render import Renderer, VolumeModel
+def _save_image(image, path, **kwargs):
+    """Save through a temporary file, so that the app never reads a half-written image."""
+    tmp_path = f'{path}.part'
+    image.save(tmp_path, format=os.path.splitext(path)[1][1:].upper(), **kwargs)
+    os.replace(tmp_path, path)
+
+
+def _image_size(long_side, shape):
+    """Width and height of an image with the tomogram's X:Y aspect ratio, given its (Z, Y, X) shape."""
+    _, ny, nx = shape
+    if nx >= ny:
+        return long_side, max(1, round(long_side * ny / nx))
+    return max(1, round(long_side * nx / ny)), long_side
+
+
+def _render_tomogram(renderer, tomo_name, df, config, feature_library, compositions, overwrite):
+    from Pom.core.render import VolumeModel
     from PIL import Image
 
+    sorted_features = df.loc[tomo_name].sort_values(ascending=False).index.tolist()
+
+    for comp_name, comp_def in compositions.items():
+        do_spin = composition_spin(comp_def)
+        png_path = os.path.join('pom', 'images', comp_name, f'{tomo_name}.png')
+        gif_path = os.path.join('pom', 'images', comp_name, f'{tomo_name}.gif')
+
+        required_outputs = [png_path] + ([gif_path] if do_spin else [])
+        if not overwrite and all(os.path.exists(p) for p in required_outputs):
+            continue
+
+        features_to_render = _resolve_composition_features(composition_features(comp_def), sorted_features, feature_library)
+        renderables = _build_renderables(features_to_render, tomo_name, config, feature_library,
+                                         surface_max_axis=RENDER_SURFACE_MAX_AXIS)
+
+        if renderables:
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+            shape = renderables[0].data.shape
+
+            # static image - render at full PNG resolution
+            renderer.set_image_size(*_image_size(RENDER_IMAGE_SIZE, shape))
+            renderer.new_image()
+            renderer.render(renderables)
+            _save_image(Image.fromarray(renderer.get_image()), png_path)
+
+            # 360-degree spin movie. Uses coarser surface meshes (binned segmentations) to cut
+            # per-frame draw cost. Volume models are reused (their cached 3D textures stay valid).
+            if do_spin:
+                spin_surfaces = _build_renderables(
+                    features_to_render, tomo_name, config, feature_library,
+                    surface_max_axis=SPIN_SURFACE_MAX_AXIS, skip_volumes=True,
+                )
+                spin_renderables = [r for r in renderables if isinstance(r, VolumeModel)] + spin_surfaces
+                _render_spin_gif(renderer, spin_renderables, gif_path, _image_size(SPIN_RENDER_SIZE, shape))
+                for r in spin_surfaces:
+                    r.delete()
+            elif os.path.exists(gif_path):
+                # the app prefers the GIF; a leftover one would hide the new PNG
+                os.remove(gif_path)
+
+            for r in renderables:
+                r.delete()
+
+
+def _render_worker(worker_index, tomo_names, df, config, feature_library, compositions, overwrite, counter, lock, errors):
+    """Worker process that creates ONE renderer and processes all assigned tomograms."""
+    import traceback
+    from Pom.core.render import Renderer, RenderContextError
+
     try:
-        renderer = Renderer(image_size=RENDER_IMAGE_SIZE)
+        try:
+            renderer = Renderer(image_size=RENDER_IMAGE_SIZE, device_index=worker_index)
+        except RenderContextError as e:
+            errors.append({'tomogram': None, 'error': str(e), 'traceback': None})
+            return
+        except Exception as e:
+            errors.append({'tomogram': None, 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()})
+            return
 
         for tomo_name in tomo_names:
-
-            if tomo_name not in df.index:
-                with lock:
-                    counter.value += 1
-                continue
-
-            sorted_features = df.loc[tomo_name].sort_values(ascending=False).index.tolist()
-
-            for comp_name, comp_def in compositions.items():
-                do_spin = composition_spin(comp_def)
-                png_path = os.path.join('pom', 'images', comp_name, f'{tomo_name}.png')
-                gif_path = os.path.join('pom', 'images', comp_name, f'{tomo_name}.gif')
-
-                required_outputs = [png_path] + ([gif_path] if do_spin else [])
-                if not overwrite and all(os.path.exists(p) for p in required_outputs):
-                    continue
-
-                features_to_render = _resolve_composition_features(composition_features(comp_def), sorted_features, feature_library)
-                renderables = _build_renderables(features_to_render, tomo_name, config, feature_library)
-
-                if renderables:
-                    os.makedirs(os.path.dirname(png_path), exist_ok=True)
-
-                    # static image - render at full PNG resolution
-                    renderer.set_image_size(RENDER_IMAGE_SIZE)
-                    renderer.new_image()
-                    renderer.render(renderables)
-                    Image.fromarray(renderer.get_image()).save(png_path)
-
-                    # 360-degree spin movie at the smaller spin resolution. Uses coarser
-                    # surface meshes (binned segmentations) to cut per-frame draw cost.
-                    # Volume models are reused (their cached 3D textures stay valid).
-                    if do_spin:
-                        renderer.set_image_size(SPIN_RENDER_SIZE)
-                        spin_surfaces = _build_renderables(
-                            features_to_render, tomo_name, config, feature_library,
-                            surface_max_axis=SPIN_SURFACE_MAX_AXIS, skip_volumes=True,
-                        )
-                        spin_renderables = [r for r in renderables if isinstance(r, VolumeModel)] + spin_surfaces
-                        _render_spin_gif(renderer, spin_renderables, gif_path)
-                        for r in spin_surfaces:
-                            r.delete()
-
-                    for r in renderables:
-                        r.delete()
+            try:
+                if tomo_name in df.index:
+                    _render_tomogram(renderer, tomo_name, df, config, feature_library, compositions, overwrite)
+            except Exception as e:
+                errors.append({'tomogram': tomo_name, 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()})
 
             # Update progress after completing this tomogram
             with lock:
@@ -859,7 +894,94 @@ def _render_worker(tomo_names, df, config, feature_library, compositions, overwr
     except KeyboardInterrupt:
         pass
 
-def render(overwrite=False):
+
+def _print_render_report(errors, exitcodes, n_workers, n_processed, n_tomograms):
+    import signal
+    import textwrap
+
+    width = 100
+    rule = '-' * width
+
+    def block(title, body):
+        print(rule)
+        print(title)
+        print(rule)
+        print(body.rstrip())
+        print()
+
+    failed = sorted({e['tomogram'] for e in errors if e['tomogram']})
+    startup_failed = any(e['tomogram'] is None for e in errors)
+    killed = [c for c in exitcodes if c < 0]
+
+    if startup_failed and not n_processed:
+        print("\nRendering failed - no images were rendered.\n")
+    else:
+        summary = f"\nRendering finished with errors: {n_processed - len(failed)} of {n_tomograms} tomograms rendered"
+        if failed:
+            summary += f", {len(failed)} failed"
+        if n_tomograms - n_processed:
+            summary += f", {n_tomograms - n_processed} not reached"
+        print(summary + ".\n")
+
+    # identical errors from different workers / tomograms are reported once
+    grouped = {}
+    for e in errors:
+        grouped.setdefault(e['error'], []).append(e)
+
+    for error, group in list(grouped.items())[:5]:
+        tomos = sorted({e['tomogram'] for e in group if e['tomogram']})
+        if tomos:
+            shown = ', '.join(tomos[:3]) + (f', ... (+{len(tomos) - 3} more)' if len(tomos) > 3 else '')
+            title = f"Error in {len(tomos)} {'tomogram' if len(tomos) == 1 else 'tomograms'}: {shown}"
+        else:
+            title = f"Error while starting the renderer ({len(group)} of {n_workers} workers)"
+        body = error
+        if group[0]['traceback']:
+            body += '\n\n' + textwrap.indent(group[0]['traceback'].rstrip(), '  ')
+        block(title, body)
+    if len(grouped) > 5:
+        print(f"... and {len(grouped) - 5} more distinct errors.\n")
+
+    if killed:
+        names = sorted({signal.Signals(-c).name for c in killed})
+        fewer = max(1, n_workers // 4)
+        if 'SIGKILL' in names:
+            body = ("The system killed these workers (SIGKILL) without a Python error. This usually means the machine\n"
+                    f"or job ran out of memory. Use fewer workers, e.g. 'pom render --workers {fewer}'.")
+        else:
+            body = (f"These workers crashed with {', '.join(names)} without a Python error, which points to the graphics\n"
+                    f"driver rather than Pom. Using fewer workers, e.g. 'pom render --workers {fewer}', may help.")
+        block(f"{len(killed)} of {n_workers} workers died", body)
+
+    if not startup_failed or n_processed:
+        print("Run 'pom render' again without --overwrite to render only the missing images.")
+
+
+def _choose_gl_platform():
+    """On Linux, render headless through EGL if it works, else through GLFW. PyOpenGL binds to one of
+    the two on first import, so this is tested in a throwaway process and passed on to the workers."""
+    import sys
+    import subprocess
+
+    if not sys.platform.startswith('linux'):
+        print("  Using GLFW for OpenGL.")
+        return
+    probe = "from Pom.core.render import _HeadlessEGLContext; _HeadlessEGLContext().delete()"
+    try:
+        result = subprocess.run([sys.executable, '-c', probe], env=dict(os.environ, PYOPENGL_PLATFORM='egl'),
+                                capture_output=True, text=True, timeout=120)
+        works, reason = result.returncode == 0, (result.stderr.strip().splitlines() or ['unknown error'])[-1]
+    except subprocess.TimeoutExpired:
+        works, reason = False, 'timed out'
+    if works:
+        os.environ['PYOPENGL_PLATFORM'] = 'egl'
+        print("  Using EGL for OpenGL (headless).")
+    else:
+        os.environ['PYOPENGL_PLATFORM'] = 'glx'
+        print(f"  Using GLFW for OpenGL, because EGL is not available ({reason}).")
+
+
+def render(overwrite=False, workers=None):
     import multiprocessing
     import itertools
     import time
@@ -888,8 +1010,9 @@ def render(overwrite=False):
 
     tomograms, n_files, max_flavours = collect_tomogram_names(config)
 
-    parallel_processes = min(os.cpu_count(), 16)
+    parallel_processes = max(1, workers) if workers else min(os.cpu_count(), 16)
     print(f"Rendering {describe_tomogram_count(len(tomograms), n_files, max_flavours)} in {len(compositions)} {'composition' if len(compositions) == 1 else 'compositions'} with {parallel_processes} workers...")
+    _choose_gl_platform()
 
     spinning = [name for name, comp in compositions.items() if composition_spin(comp)]
     if spinning:
@@ -906,13 +1029,14 @@ def render(overwrite=False):
     manager = multiprocessing.Manager()
     counter = manager.Value('i', 0)
     lock = manager.Lock()
+    errors = manager.list()
 
     processes = []
     try:
         for p in process_div:
             proc = multiprocessing.Process(
                 target=_render_worker,
-                args=(process_div[p], df, config, feature_library, compositions, overwrite, counter, lock)
+                args=(p, process_div[p], df, config, feature_library, compositions, overwrite, counter, lock, errors)
             )
             processes.append(proc)
             proc.start()
@@ -935,7 +1059,12 @@ def render(overwrite=False):
         for proc in processes:
             proc.join()
 
-        print("Rendering complete!")
+        exitcodes = [proc.exitcode for proc in processes if proc.exitcode != 0]
+        errors = list(errors)
+        if errors or exitcodes:
+            _print_render_report(errors, exitcodes, len(processes), counter.value, len(tomograms))
+        else:
+            print("Rendering complete!")
     except KeyboardInterrupt:
         print("\nInterrupted by user. Terminating processes...")
         for proc in processes:
@@ -944,8 +1073,9 @@ def render(overwrite=False):
             proc.join()
         print("Rendering cancelled.")
 
-def _render_spin_gif(renderer, renderables, output_path, frames=SPIN_FRAMES, fps=SPIN_FPS):
-    """Render a 360-degree spin movie (animated GIF) of already-built renderables.
+def _render_spin_gif(renderer, renderables, output_path, size, frames=SPIN_FRAMES, fps=SPIN_FPS):
+    """Render a 360-degree spin movie (animated GIF) of already-built renderables, with frames
+    rendered at the renderer's current size and scaled down to `size` (width, height).
 
     The camera yaw sweeps a full turn over `frames` frames; the original yaw is restored
     afterwards so subsequent static renders are unaffected.
@@ -959,13 +1089,13 @@ def _render_spin_gif(renderer, renderables, output_path, frames=SPIN_FRAMES, fps
         renderer.camera.on_update()
         renderer.new_image()
         renderer.render(renderables)
-        images.append(Image.fromarray(renderer.get_image()))
+        images.append(Image.fromarray(renderer.get_image()).resize(size, Image.LANCZOS))
 
     renderer.camera.yaw = base_yaw
     renderer.camera.on_update()
 
     duration_ms = int(round(1000.0 / fps))
-    images[0].save(output_path, save_all=True, append_images=images[1:], duration=duration_ms, loop=0, disposal=2, optimize=True)
+    _save_image(images[0], output_path, save_all=True, append_images=images[1:], duration=duration_ms, loop=0, disposal=2, optimize=True)
 
 
 def _bin_volume(vol, b):

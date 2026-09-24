@@ -1,7 +1,7 @@
 import streamlit as st
 import copy
 import numpy as np
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 from Pom.app.util import load_data
 from Pom.core.tools import get_feature_library
 from matplotlib import colors
@@ -107,7 +107,6 @@ grid_options = gb.build()
 grid_response = AgGrid(
     filtered_df,
     gridOptions=grid_options,
-    update_mode=GridUpdateMode.SELECTION_CHANGED,
     height=2700,
     theme="streamlit",
     allow_unsafe_jscode=True,  # Allow HTML rendering for clickable links

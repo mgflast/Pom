@@ -31,6 +31,8 @@ if "library" not in st.session_state:
     st.session_state.library = library
 
 lib = st.session_state.library
+for feat in feature_names:
+    lib.setdefault(feat, library[feat])
 
 "  "
 "  "

@@ -1,7 +1,13 @@
+import os
+import sys
+import contextlib
 from Pom.core.opengl_classes import *
+from Pom.core.opengl_classes import _log_str
+from OpenGL.platform import PLATFORM as _GL_PLATFORM
 import glfw
+import warnings
 from skimage import measure
-from scipy.ndimage import label, binary_dilation, gaussian_filter
+from scipy.ndimage import label, find_objects, binary_dilation, gaussian_filter
 
 PIXEL_SCALE = 1024
 
@@ -10,20 +16,154 @@ PIXEL_SCALE = 1024
 # render style
 # camera pitch and yaw
 
+# PyOpenGL binds to GLX or EGL on first import; tools._choose_gl_platform decides which for the workers
+HEADLESS_EGL = type(_GL_PLATFORM).__module__ == 'OpenGL.platform.egl'
+
+
+class RenderContextError(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def _quiet_stderr():
+    # Mesa's driver loader writes straight to stderr, ignoring EGL_LOG_LEVEL, for every NVIDIA card
+    # it finds and cannot drive. Errors still surface as exceptions.
+    sys.stderr.flush()
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+def _egl_error_str(e):
+    # EGLError's own repr includes object addresses, which would stop identical failures from grouping
+    if hasattr(e, 'err'):
+        operation = getattr(e.baseOperation, '__name__', e.baseOperation)
+        return f"{operation} failed with {e.err}"
+    return str(e)
+
+
+class _HeadlessEGLContext:
+    """OpenGL context straight on a GPU through EGL, with no window or display server involved."""
+
+    def __init__(self, device_index=0):
+        from OpenGL import EGL
+        self.EGL = EGL
+        self.display = self._open_display(device_index)
+        EGL.eglBindAPI(EGL.EGL_OPENGL_API)
+
+        config_attribs = (EGL.EGLint * 11)(EGL.EGL_SURFACE_TYPE, EGL.EGL_PBUFFER_BIT,
+                                           EGL.EGL_RENDERABLE_TYPE, EGL.EGL_OPENGL_BIT,
+                                           EGL.EGL_RED_SIZE, 8, EGL.EGL_GREEN_SIZE, 8, EGL.EGL_BLUE_SIZE, 8,
+                                           EGL.EGL_NONE)
+        configs = (EGL.EGLConfig * 1)()
+        n_configs = EGL.EGLint()
+        EGL.eglChooseConfig(self.display, config_attribs, configs, 1, n_configs)
+        if not n_configs.value:
+            raise RuntimeError("eglChooseConfig found no OpenGL config with a pbuffer surface")
+        config = configs[0]
+
+        context_attribs = (EGL.EGLint * 7)(EGL.EGL_CONTEXT_MAJOR_VERSION, 4,
+                                           EGL.EGL_CONTEXT_MINOR_VERSION, 3,
+                                           EGL.EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                           EGL.EGL_NONE)
+        self.context = EGL.eglCreateContext(self.display, config, EGL.EGL_NO_CONTEXT, context_attribs)
+        if not self.context:
+            raise RuntimeError("eglCreateContext failed")
+
+        # everything is drawn into FBOs, so the surface only has to exist
+        surface_attribs = (EGL.EGLint * 5)(EGL.EGL_WIDTH, 16, EGL.EGL_HEIGHT, 16, EGL.EGL_NONE)
+        self.surface = EGL.eglCreatePbufferSurface(self.display, config, surface_attribs)
+        if not self.surface:
+            raise RuntimeError("eglCreatePbufferSurface failed")
+        if not EGL.eglMakeCurrent(self.display, self.surface, self.surface, self.context):
+            raise RuntimeError("eglMakeCurrent failed")
+
+    def _open_display(self, device_index):
+        # Pick a GPU explicitly, so that workers spread over all GPUs. Not every listed device can be
+        # opened (with glvnd, Mesa also lists the NVIDIA cards it cannot drive), so try them in turn,
+        # with Mesa's CPU renderer and then the default display as the last resorts.
+        EGL = self.EGL
+        candidates = []
+        try:
+            from OpenGL.EGL.EXT.device_enumeration import eglQueryDevicesEXT
+            from OpenGL.EGL.EXT.device_query import eglQueryDeviceStringEXT
+            from OpenGL.EGL.EXT.platform_base import eglGetPlatformDisplayEXT
+            from OpenGL.EGL.EXT.platform_device import EGL_PLATFORM_DEVICE_EXT
+            devices = (EGL.EGLDeviceEXT * 32)()
+            n_devices = EGL.EGLint()
+            eglQueryDevicesEXT(32, devices, n_devices)
+            gpus, software = [], []
+            for d in devices[:n_devices.value]:
+                software_device = b'EGL_MESA_device_software' in (eglQueryDeviceStringEXT(d, EGL.EGL_EXTENSIONS) or b'')
+                (software if software_device else gpus).append(d)
+            k = device_index % len(gpus) if gpus else 0
+            candidates = [lambda d=d: eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, d, None)
+                          for d in gpus[k:] + gpus[:k] + software]
+        except Exception:
+            pass
+        candidates.append(lambda: EGL.eglGetDisplay(EGL.EGL_DEFAULT_DISPLAY))
+
+        error = "no EGL display found"
+        for get_display in candidates:
+            try:
+                display = get_display()
+                if display and EGL.eglInitialize(display, EGL.EGLint(), EGL.EGLint()):
+                    return display
+            except Exception as e:
+                error = _egl_error_str(e)
+        raise RuntimeError(error)
+
+    def delete(self):
+        EGL = self.EGL
+        EGL.eglMakeCurrent(self.display, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, EGL.EGL_NO_CONTEXT)
+        EGL.eglTerminate(self.display)
+
+
+def _resolve_missing_gl_functions():
+    # PyOpenGL looks functions up as libGL exports; older libGL builds leave out the post-3.x ones
+    import OpenGL.GL
+    from OpenGL.platform import PLATFORM
+    from OpenGL.platform.baseplatform import _NullFunctionPointer
+    for f in list(vars(OpenGL.GL).values()):
+        f = getattr(f, 'wrappedOperation', f)
+        if not isinstance(f, _NullFunctionPointer) or f.resolved:
+            continue
+        pointer = glfw.get_proc_address(f.__name__)
+        if not pointer:
+            continue
+        func = PLATFORM.functionTypeFor(f.DLL)(f.restype, *[PLATFORM.finalArgType(t) for t in f.argtypes])(pointer)
+        func = PLATFORM.errorChecking(func, f.DLL, error_checker=f.error_checker)
+        type(f).__call__ = staticmethod(func)
+        type(f).resolved = True
+
+
 class Renderer:
-    def __init__(self, image_size=1024):
-        if not glfw.init():
-            raise Exception("GLFW initialization failed.")
+    def __init__(self, image_size=1024, device_index=0):
+        self.egl_context = None
+        if HEADLESS_EGL:
+            try:
+                with _quiet_stderr():
+                    self.egl_context = _HeadlessEGLContext(device_index)
+            except Exception as e:
+                raise RenderContextError(
+                    "Pom could not open an OpenGL context on the GPU through EGL, so nothing was rendered.\n"
+                    f"EGL reported: {_egl_error_str(e)}")
+        else:
+            self._open_glfw_context()
 
-        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, GL_TRUE)
-        glfw.window_hint(glfw.SAMPLES, 4)
-
-        self.window = glfw.create_window(10, 10, "Offscreen Render", None, None)
-        glfw.make_context_current(self.window)
+        version = (glGetIntegerv(GL_MAJOR_VERSION), glGetIntegerv(GL_MINOR_VERSION))
+        if version < (4, 3):
+            description = f"OpenGL {version[0]}.{version[1]} ({_log_str(glGetString(GL_RENDERER))})"
+            self.delete()
+            raise RenderContextError(
+                f"Pom needs OpenGL 4.3 to render, but this session only offers {description}, so nothing was rendered.\n"
+                "Run 'pom render' on a machine with a GPU, or with a recent Mesa.")
         glEnable(GL_MULTISAMPLE)
 
         module_root = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +175,7 @@ class Renderer:
 
         self.style = 1
 
-        self.image_size = image_size
+        self.width = self.height = image_size
         self.texture3d = glGenTextures(1, GL_TEXTURE_3D)
         glBindTexture(GL_TEXTURE_3D, self.texture3d)
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
@@ -43,11 +183,11 @@ class Renderer:
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-        self.scene_fbo = FrameBuffer(width=self.image_size, height=self.image_size, texture_format="rgba32f")
-        self.scene_fbo_b = FrameBuffer(width=self.image_size, height=self.image_size, texture_format="rgba32f")
-        self.depth_fbo_a = FrameBuffer(width=self.image_size, height=self.image_size, texture_format="rgba32f")
-        self.depth_fbo_b = FrameBuffer(width=self.image_size, height=self.image_size, texture_format="rgba32f")
-        self.volume_fbo = FrameBuffer(width=self.image_size, height=self.image_size, texture_format="rgba32f")
+        self.scene_fbo = FrameBuffer(width=self.width, height=self.height, texture_format="rgba32f")
+        self.scene_fbo_b = FrameBuffer(width=self.width, height=self.height, texture_format="rgba32f")
+        self.depth_fbo_a = FrameBuffer(width=self.width, height=self.height, texture_format="rgba32f")
+        self.depth_fbo_b = FrameBuffer(width=self.width, height=self.height, texture_format="rgba32f")
+        self.volume_fbo = FrameBuffer(width=self.width, height=self.height, texture_format="rgba32f")
         self.box_va = VertexArray(attribute_format="xyz")
         self.box_va_shape = (0, 0, 0)
         self.ndc_screen_va = VertexArray(attribute_format="xy")
@@ -58,12 +198,48 @@ class Renderer:
         self.RENDER_SILHOUETTES_ALPHA = 0.7
         self.RENDER_SILHOUETTES_THRESHOLD = 0.01
 
-        self.camera = Camera3D(self.image_size)
+        self.camera = Camera3D(self.width, self.height)
         self.camera.on_update()
         self.volume_fbo_active = False
         self.light = Light3D()
         self.ambient_strength = 1.2
         self.background_colour = (1.0, 1.0, 1.0, 0.0)
+
+    def _open_glfw_context(self):
+        os.environ.setdefault('EGL_LOG_LEVEL', 'fatal')
+        if not glfw.init():
+            raise RenderContextError(
+                "Pom could not start GLFW, so nothing was rendered.\n"
+                "This usually means there is no display ($DISPLAY is unset). Run as 'xvfb-run -a pom render'.")
+
+        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
+        glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+        glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, GL_TRUE)
+        self.window = None
+        with warnings.catch_warnings(record=True) as glfw_warnings:
+            warnings.simplefilter("always")
+            for samples, api in ((4, glfw.NATIVE_CONTEXT_API), (0, glfw.NATIVE_CONTEXT_API), (0, glfw.EGL_CONTEXT_API)):
+                glfw.window_hint(glfw.SAMPLES, samples)
+                glfw.window_hint(glfw.CONTEXT_CREATION_API, api)
+                self.window = glfw.create_window(10, 10, "Offscreen Render", None, None)
+                if self.window:
+                    break
+        if not self.window:
+            glfw.terminate()
+            reasons = "\n".join(f"  {w.message}" for w in glfw_warnings)
+            raise RenderContextError(
+                "Pom could not open an OpenGL 4.3 context, so nothing was rendered.\n"
+                "This usually means the session has no GPU-backed display.\n"
+                "Run 'pom render' on a machine with a local display, or as 'xvfb-run -a pom render'.\n"
+                f"GLFW reported:\n{reasons}")
+        glfw.make_context_current(self.window)
+        # PyOpenGL looks the context up via GLX and finds nothing when GLFW made it with EGL
+        import OpenGL.platform
+        if not OpenGL.platform.GetCurrentContext():
+            OpenGL.platform.GetCurrentContext = lambda: 1
+        _resolve_missing_gl_functions()
 
     @staticmethod
     def poll_gl_states():
@@ -88,26 +264,28 @@ class Renderer:
             print(f'{cap_name}: {"Enabled" if state else "Disabled"}')
 
     def delete(self):
-        glfw.terminate()
+        if self.egl_context:
+            self.egl_context.delete()
+        else:
+            glfw.terminate()
 
-    def set_image_size(self, size):
-        """Resize the render target FBOs to a square `size`x`size`. The renderables
+    def set_image_size(self, width, height):
+        """Resize the render target FBOs to `width`x`height`. The renderables
         (SurfaceModel VAOs, VolumeModel textures, shaders) are untouched - they live in
-        the same GL context. Camera projection is re-emitted to match the new aspect
-        (still square, but kept consistent)."""
-        if size == self.image_size:
+        the same GL context. Camera projection is re-emitted to match the new aspect."""
+        if (width, height) == (self.width, self.height):
             return
         for fbo in (self.scene_fbo, self.scene_fbo_b, self.depth_fbo_a, self.depth_fbo_b, self.volume_fbo):
             glDeleteTextures(1, [fbo.texture.renderer_id])
             glDeleteTextures(1, [fbo.depth_texture_renderer_id])
             glDeleteFramebuffers(1, [fbo.framebufferObject])
-        self.image_size = size
-        self.scene_fbo = FrameBuffer(width=size, height=size, texture_format="rgba32f")
-        self.scene_fbo_b = FrameBuffer(width=size, height=size, texture_format="rgba32f")
-        self.depth_fbo_a = FrameBuffer(width=size, height=size, texture_format="rgba32f")
-        self.depth_fbo_b = FrameBuffer(width=size, height=size, texture_format="rgba32f")
-        self.volume_fbo = FrameBuffer(width=size, height=size, texture_format="rgba32f")
-        self.camera.set_projection_matrix(size, size)
+        self.width, self.height = width, height
+        self.scene_fbo = FrameBuffer(width=width, height=height, texture_format="rgba32f")
+        self.scene_fbo_b = FrameBuffer(width=width, height=height, texture_format="rgba32f")
+        self.depth_fbo_a = FrameBuffer(width=width, height=height, texture_format="rgba32f")
+        self.depth_fbo_b = FrameBuffer(width=width, height=height, texture_format="rgba32f")
+        self.volume_fbo = FrameBuffer(width=width, height=height, texture_format="rgba32f")
+        self.camera.set_projection_matrix(width, height)
         self.camera.on_update()
 
     def render(self, renderables_list):
@@ -128,14 +306,14 @@ class Renderer:
         glClearColor(0.0, 0.0, 0.0, 0.0)
         glClear(GL_COLOR_BUFFER_BIT)
 
-        Z, X, Y = m_volumes[0].data.shape
+        Z, Y, X = m_volumes[0].data.shape
         self.ray_trace_shader.bind()
         self.ray_trace_shader.uniformmat4("ipMat", self.camera.ipmat)
         self.ray_trace_shader.uniformmat4("ivMat", self.camera.ivmat)
         self.ray_trace_shader.uniformmat4("pMat", self.camera.pmat)
         self.ray_trace_shader.uniform1f("near", self.camera.clip_near)
         self.ray_trace_shader.uniform1f("far", self.camera.clip_far)
-        self.ray_trace_shader.uniform2f("viewportSize", (self.image_size, self.image_size))
+        self.ray_trace_shader.uniform2f("viewportSize", (self.width, self.height))
         self.ray_trace_shader.uniform1f("pixelSize", PIXEL_SCALE / m_volumes[0].data.shape[1])
         self.ray_trace_shader.uniform1i("Z", Z)
         self.ray_trace_shader.uniform1i("Y", Y)
@@ -159,11 +337,11 @@ class Renderer:
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
                 glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-                glTexImage3D(GL_TEXTURE_3D, 0, GL_RED, v.data.shape[1], v.data.shape[2], v.data.shape[0], 0, GL_RED, GL_FLOAT, v.data.flatten())
+                glTexImage3D(GL_TEXTURE_3D, 0, GL_RED, X, Y, Z, 0, GL_RED, GL_FLOAT, v.data.flatten())
             else:
                 glBindTexture(GL_TEXTURE_3D, v.gl_texture)
             self.ray_trace_shader.uniform3f("C", v.colour)
-            glDispatchCompute(self.image_size // 32, self.image_size // 32, 1)
+            glDispatchCompute((self.width + 31) // 32, (self.height + 31) // 32, 1)
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
 
@@ -211,7 +389,7 @@ class Renderer:
         if len(alpha_sorted_surface_models) > 0:
             glBindFramebuffer(GL_READ_FRAMEBUFFER, self.scene_fbo.framebufferObject)
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.scene_fbo_b.framebufferObject)
-            glBlitFramebuffer(0, 0, self.image_size, self.image_size, 0, 0, self.image_size, self.image_size, GL_DEPTH_BUFFER_BIT, GL_NEAREST)
+            glBlitFramebuffer(0, 0, self.width, self.height, 0, 0, self.width, self.height, GL_DEPTH_BUFFER_BIT, GL_NEAREST)
             glBindFramebuffer(GL_FRAMEBUFFER, self.scene_fbo.framebufferObject)
             self.edge_shader.bind()
             glActiveTexture(GL_TEXTURE0)
@@ -229,8 +407,8 @@ class Renderer:
         if self.box_va_shape != vol_size:
             self.box_va_shape = vol_size
             render_pixel_size = PIXEL_SCALE / vol_size[1]
-            w = vol_size[1] / 2 * render_pixel_size
-            h = vol_size[2] / 2 * render_pixel_size
+            w = vol_size[2] / 2 * render_pixel_size
+            h = vol_size[1] / 2 * render_pixel_size
             d = vol_size[0] / 2 * render_pixel_size
             vertices = [-w, h, d,
                         w, h, d,
@@ -246,8 +424,8 @@ class Renderer:
 
         # read scene depth
         self.scene_fbo_b.bind()
-        data = glReadPixels(0, 0, self.image_size, self.image_size, GL_DEPTH_COMPONENT, GL_FLOAT)
-        scene_depth = np.frombuffer(data, dtype=np.float32).reshape(self.image_size, self.image_size)
+        data = glReadPixels(0, 0, self.width, self.height, GL_DEPTH_COMPONENT, GL_FLOAT)
+        scene_depth = np.frombuffer(data, dtype=np.float32).reshape(self.height, self.width)
 
         # render the provisional stop depth
         self.depth_fbo_a.bind()
@@ -266,12 +444,12 @@ class Renderer:
 
         # find the actual stop depth: minimum(scene_depth, stop_depth) and write to fbo a depth texture.
         self.depth_fbo_a.bind()
-        data = glReadPixels(0, 0, self.image_size, self.image_size, GL_DEPTH_COMPONENT, GL_FLOAT)
-        stop_depth = np.frombuffer(data, dtype=np.float32).reshape(self.image_size, self.image_size)
+        data = glReadPixels(0, 0, self.width, self.height, GL_DEPTH_COMPONENT, GL_FLOAT)
+        stop_depth = np.frombuffer(data, dtype=np.float32).reshape(self.height, self.width)
         stop_depth = np.minimum(scene_depth, stop_depth)
         glBindTexture(GL_TEXTURE_2D, self.depth_fbo_a.depth_texture_renderer_id)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, self.image_size, self.image_size, 0, GL_DEPTH_COMPONENT, GL_FLOAT, stop_depth.flatten())
-        self.depth_fbo_a.unbind((0, 0, self.image_size, self.image_size))
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, self.width, self.height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, stop_depth.flatten())
+        self.depth_fbo_a.unbind((0, 0, self.width, self.height))
 
         # render the start depth
         self.depth_fbo_b.bind()
@@ -294,7 +472,7 @@ class Renderer:
         self.depth_mask_shader.unbind()
         glFinish()
 
-        self.depth_fbo_b.unbind((0, 0, self.image_size, self.image_size))
+        self.depth_fbo_b.unbind((0, 0, self.width, self.height))
         glDepthFunc(GL_LESS)
         glClearDepth(1.0)
 
@@ -312,8 +490,8 @@ class Renderer:
     def get_image(self):
         self.scene_fbo.bind()
         glBindTexture(GL_TEXTURE_2D, self.scene_fbo.texture.renderer_id)
-        data = glReadPixels(0, 0, self.image_size, self.image_size, GL_RGBA, GL_FLOAT)
-        image = np.frombuffer(data, dtype=np.float32).reshape((self.image_size, self.image_size, 4))
+        data = glReadPixels(0, 0, self.width, self.height, GL_RGBA, GL_FLOAT)
+        image = np.frombuffer(data, dtype=np.float32).reshape((self.height, self.width, 4))
         image = np.flip(image, axis=0)[:, :, :3] * 255
         image = np.clip(image, 0, 255)
         image = image.astype(np.uint8)
@@ -403,22 +581,13 @@ class SurfaceModel:
         new_blobs = dict()
 
         labels, N = label(data >= self.level)
-        Z, Y, X = np.nonzero(labels)
-        for i in range(len(Z)):
-            z = Z[i]
-            y = Y[i]
-            x = X[i]
-            l = labels[z, y, x]
-            if l not in new_blobs:
-                new_blobs[l] = SurfaceModelBlob(data, self.level, self.render_pixel_size, origin, self.true_pixel_size)
-            new_blobs[l].x.append(x)
-            new_blobs[l].y.append(y)
-            new_blobs[l].z.append(z)
-
-        # 3: upload surface blobs one by one.
-        for i in new_blobs:
+        voxel_counts = np.bincount(labels.ravel(), minlength=N + 1)
+        for l, bbox in enumerate(find_objects(labels), start=1):
+            if bbox is None:
+                continue
+            new_blobs[l] = SurfaceModelBlob(data, self.level, self.render_pixel_size, origin, self.true_pixel_size)
             try:
-                new_blobs[i].compute_mesh()
+                new_blobs[l].compute_mesh(labels[bbox] == l, bbox, voxel_counts[l])
             except Exception:
                 pass
 
@@ -440,9 +609,6 @@ class SurfaceModelBlob:
         self.true_pixel_size = true_pixel_size
 
         self.origin = origin
-        self.x = list()
-        self.y = list()
-        self.z = list()
         self.volume = 0
         self.indices = list()
         self.vertices = list()
@@ -453,24 +619,14 @@ class SurfaceModelBlob:
         self.complete = False
         self.hide = False
 
-    def compute_mesh(self):
-        self.volume = len(self.x) * self.true_pixel_size**3
-        self.x = np.array(self.x)
-        self.y = np.array(self.y)
-        self.z = np.array(self.z)
+    def compute_mesh(self, blob_mask, bbox, n_voxels):
+        self.volume = n_voxels * self.true_pixel_size**3
 
-        rx = (np.amin(self.x), np.amax(self.x)+2)
-        ry = (np.amin(self.y), np.amax(self.y)+2)
-        rz = (np.amin(self.z), np.amax(self.z)+2)
-        box = np.zeros((1 + rz[1]-rz[0] + 1, 1 + ry[1]-ry[0] + 1, 1 + rx[1]-rx[0] + 1))
+        rz, ry, rx = [(s.start, s.stop + 1) for s in bbox]
+        box = np.zeros((1 + rz[1]-rz[0] + 1, 1 + ry[1]-ry[0] + 1, 1 + rx[1]-rx[0] + 1), dtype=np.float32)
         box[1:-1, 1:-1, 1:-1] = self.data[rz[0]:rz[1], ry[0]:ry[1], rx[0]:rx[1]]
-        mask = np.zeros((1 + rz[1]-rz[0] + 1, 1 + ry[1]-ry[0] + 1, 1 + rx[1]-rx[0] + 1), dtype=bool)
-
-        mx = self.x - rx[0] + 1
-        my = self.y - ry[0] + 1
-        mz = self.z - rz[0] + 1
-        for x, y, z in zip(mx, my, mz):
-            mask[z, y, x] = True
+        mask = np.zeros(box.shape, dtype=bool)
+        mask[1:-2, 1:-2, 1:-2] = blob_mask
         mask = binary_dilation(mask, iterations=2)
         box *= mask
         vertices, faces, normals, _ = measure.marching_cubes(box, level=self.level)
@@ -519,7 +675,7 @@ class Light3D:
 
 
 class Camera3D:
-    def __init__(self, image_size):
+    def __init__(self, width, height):
         self.view_matrix = np.eye(4)
         self.projection_matrix = np.eye(4)
         self.view_projection_matrix = np.eye(4)
@@ -531,7 +687,7 @@ class Camera3D:
         self.clip_far = 1e4
         self.projection_width = 1
         self.projection_height = 1
-        self.set_projection_matrix(image_size, image_size)
+        self.set_projection_matrix(width, height)
 
     def set_projection_matrix(self, window_width, window_height):
         self.projection_width = window_width

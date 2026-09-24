@@ -114,7 +114,11 @@ def get_image(tomo_name, feature):
         # return the path (st.image animates a file path/bytes, but not a PIL Image).
         gif_path = os.path.join('pom', 'images', feature, f'{tomo_name}.gif')
         if os.path.exists(gif_path):
-            return gif_path
+            try:
+                Image.open(gif_path).close()  # an unreadable GIF would crash st.image; use the PNG then
+                return gif_path
+            except Exception:
+                pass
         img_path = os.path.join('pom', 'images', feature, f'{tomo_name}.png')
         if not os.path.exists(img_path):
             img_path = os.path.join('pom', 'images', f'{feature}_projection', f'{tomo_name}.png')

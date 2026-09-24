@@ -102,6 +102,10 @@ class Texture:
         self.wants_mipmap = False
 
 
+def _log_str(log):
+    return log.decode('utf-8') if isinstance(log, bytes) else str(log)
+
+
 class Shader:
     def __init__(self, sourcecode=None):
         if sourcecode:
@@ -144,12 +148,12 @@ class Shader:
                     strShaderType = "geometry"
                 elif key == GL_COMPUTE_SHADER:
                     strShaderType = "compute"
-                raise RuntimeError("Shaders compilation failure for type "+strShaderType+":\n" + glGetShaderInfoLog(shaderObjects[-1]).decode('utf-8'))
+                raise RuntimeError("Shaders compilation failure for type "+strShaderType+":\n" + _log_str(glGetShaderInfoLog(shaderObjects[-1])))
             glAttachShader(self.shaderProgram, shaderObjects[-1])
         glLinkProgram(self.shaderProgram)
         status = glGetProgramiv(self.shaderProgram, GL_LINK_STATUS)
         if status == GL_FALSE:
-            raise RuntimeError("Shaders link failure:\n"+glGetProgramInfoLog(self.shaderProgram).decode('utf-8'))
+            raise RuntimeError("Shaders link failure:\n"+_log_str(glGetProgramInfoLog(self.shaderProgram)))
         for shader in shaderObjects:
             glDetachShader(self.shaderProgram, shader)
             glDeleteShader(shader)

@@ -51,6 +51,7 @@ def main():
 
     commands["render"] = subparsers.add_parser("render", help="Render isosurface images for tomogram compositions.")
     commands["render"].add_argument('--overwrite', action='store_true', help='Overwrite existing images')
+    commands["render"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: min(cpu_count, 16)).')
 
     commands["browse"] = subparsers.add_parser("browse", help="Launch Streamlit app to browse tomograms and segmentations.")
 
@@ -98,7 +99,7 @@ def main():
     elif args.command == 'render':
         if not args.overwrite:
             print("To update existing images, remember to include the flag `--overwrite`.")
-        tools.render(args.overwrite)
+        tools.render(args.overwrite, workers=args.workers)
     elif args.command == 'create_mask':
         tools.create_mask(args.name, args.samplers, output_dir=args.output_dir, dust=args.dust, subset=args.subset, workers=args.workers, overwrite=args.overwrite)
     elif args.command == 'contextualize':
