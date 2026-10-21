@@ -8,6 +8,14 @@ from tqdm import tqdm
 import pandas as pd
 from scipy import ndimage
 
+def available_cpus():
+    """CPUs this process may use. On a cluster, os.cpu_count() reports the whole node rather than
+    the CPUs allocated to the job; the affinity mask does respect the allocation (Linux only)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
 DEFAULT_COLOURS = {
     "membrane": "#777777",
     "ribosome": "#ffd700",
@@ -452,8 +460,8 @@ def _process_segmentation(args):
     except:
         return None
 
-def summarize(overwrite=True, target_feature=None):
-    workers = min([os.cpu_count(), 32])
+def summarize(overwrite=True, target_feature=None, workers=None):
+    workers = max(1, workers) if workers else min(available_cpus(), 32)
     config = get_config()
     summary_path = os.path.join('pom', 'summary.star')
 
@@ -666,16 +674,16 @@ def _process_projection(args):
     from PIL import Image
     file_path, output_path, is_tomogram = args
     try:
-        volume = mrcfile.read(file_path)
-
         if is_tomogram:
-            central_idx = volume.shape[0] // 2
-            slice_data = volume[central_idx, :, :]
+            # only the central slice is needed, so don't read the whole tomogram into memory
+            with mrcfile.mmap(file_path, mode='r', permissive=True) as mrc:
+                slice_data = np.array(mrc.data[mrc.data.shape[0] // 2, :, :], dtype=np.float32)
             p_low, p_high = np.percentile(slice_data, [1, 99])
             slice_data = np.clip(slice_data, p_low, p_high)
             denom = p_high - p_low
             slice_data = np.zeros_like(slice_data, dtype=np.uint8) if denom == 0 else ((slice_data - p_low) / denom * 255).astype(np.uint8)
         else:
+            volume = mrcfile.read(file_path)
             max_value = 127 if volume.dtype == np.int8 else 255 if volume.dtype == np.uint16 else 1.0
             if max_value == 1.0:
                 volume[volume == 2] = 0
@@ -692,8 +700,11 @@ def _process_projection(args):
     except:
         return False
 
-def projections(overwrite=False):
-    workers = 32
+def projections(overwrite=False, workers=None):
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    workers = max(1, workers) if workers else min(available_cpus(), 16)
     config = get_config()
 
     tasks = []
@@ -719,8 +730,16 @@ def projections(overwrite=False):
 
     print(f"Projecting images for {len(tasks)} volumes with {workers} workers...")
 
-    with Pool(workers) as pool:
-        results = list(tqdm(pool.imap_unordered(_process_projection, tasks), total=len(tasks)))
+    # unlike multiprocessing.Pool, which waits forever for the result of a worker that the system killed
+    # (e.g. for running out of memory), ProcessPoolExecutor raises BrokenProcessPool
+    try:
+        with ProcessPoolExecutor(workers) as pool:
+            results = list(tqdm(pool.map(_process_projection, tasks), total=len(tasks)))
+    except BrokenProcessPool:
+        print("\nA worker process stopped unexpectedly. Run 'pom projections' again to continue; existing images are kept.")
+        return
+    if not all(results):
+        print(f"Could not project {results.count(False)} of {len(tasks)} volumes.")
 
 def _resolve_composition_features(comp_def, sorted_features, feature_library):
     """Resolve a composition definition (feature names, 'rankN' placeholders, and '!exclude'
@@ -1010,7 +1029,7 @@ def render(overwrite=False, workers=None):
 
     tomograms, n_files, max_flavours = collect_tomogram_names(config)
 
-    parallel_processes = max(1, workers) if workers else min(os.cpu_count(), 16)
+    parallel_processes = max(1, workers) if workers else min(available_cpus(), 16)
     print(f"Rendering {describe_tomogram_count(len(tomograms), n_files, max_flavours)} in {len(compositions)} {'composition' if len(compositions) == 1 else 'compositions'} with {parallel_processes} workers...")
     _choose_gl_platform()
 
@@ -1311,7 +1330,7 @@ def create_mask(name, samplers, output_dir=None, dust=0.0, subset=None, workers=
             print(f"  Final: drop components < {dust:.2e} Å³")
     print(f"  Output: {output_dir}/<tomo>__{name}.mrc\n")
 
-    parallel_processes = workers if workers is not None else min(os.cpu_count(), 16)
+    parallel_processes = workers if workers is not None else min(available_cpus(), 16)
     process_div = {p: [] for p in range(parallel_processes)}
     for p, tomo in zip(itertools.cycle(range(parallel_processes)), tomograms):
         process_div[p].append(tomo)
@@ -1590,7 +1609,7 @@ def contextualize_starfile(star_path, samplers, tomogram_name=None, substitution
         print(f'No column "{tomo_col}" found in {star_path}. Aborting.')
         return
 
-    parallel_processes = workers if workers is not None else min(os.cpu_count(), 32)
+    parallel_processes = workers if workers is not None else min(available_cpus(), 32)
     tomograms = df[tomo_col].unique()
     process_div = {p: [] for p in range(parallel_processes)}
     for p, tomogram in zip(itertools.cycle(range(parallel_processes)), tomograms):

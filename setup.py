@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='Pom-cryoET',
-    version='1.2.1',
+    version='1.2.2',
     packages=find_packages(),
     entry_points={'console_scripts': ['pom=Pom.main:main']},
     license='GPL v3',

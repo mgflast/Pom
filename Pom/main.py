@@ -41,6 +41,7 @@ def main():
     commands["summarize"] = subparsers.add_parser("summarize", help="Generate summary of all tomograms and segmentations.")
     commands["summarize"].add_argument('--overwrite', action='store_true', help='Overwrite existing entries')
     commands["summarize"].add_argument('--feature', required=False, help='Ignore all but this feature')
+    commands["summarize"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: number of available CPUs, at most 32).')
     commands["summarize"].add_argument('--starfile', type=str, default=None, help='Path to a particle star file. Counts particles per tomogram and adds as a column to the summary.')
     commands["summarize"].add_argument('--tomo-column', type=str, default=None, help='(--starfile only) Column name for tomogram identifier. Defaults to rlnMicrographName or wrpSourceName.')
     commands["summarize"].add_argument('--column-name', type=str, default=None, help='(--starfile only) Name of the summary column. Defaults to star file basename.')
@@ -48,10 +49,11 @@ def main():
 
     commands["projections"] = subparsers.add_parser("projections", help="Generate projection images for all tomograms and segmentations.")
     commands["projections"].add_argument('--overwrite', action='store_true', help='Overwrite existing images')
+    commands["projections"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: number of available CPUs, at most 16)).')
 
     commands["render"] = subparsers.add_parser("render", help="Render isosurface images for tomogram compositions.")
     commands["render"].add_argument('--overwrite', action='store_true', help='Overwrite existing images')
-    commands["render"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: min(cpu_count, 16)).')
+    commands["render"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: number of available CPUs, at most 16)).')
 
     commands["browse"] = subparsers.add_parser("browse", help="Launch Streamlit app to browse tomograms and segmentations.")
 
@@ -65,7 +67,7 @@ def main():
     commands["contextualize"].add_argument('--out_star', type=str, default=None, help='Path to output star file. If not provided, will overwrite input star file.')
     commands["contextualize"].add_argument('--apix', type=float, default=None, help='Pixel size (in Angstrom) of the coordinate system in the star file.')
     commands["contextualize"].add_argument('--binning', type=int, default=1, help='Bin segmentation volumes before computing distance maps (default 1). Higher values (2, 3, 4) speed up distance samplers with marginal accuracy loss.')
-    commands["contextualize"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: min(cpu_count, 32)).')
+    commands["contextualize"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: number of available CPUs, at most 32)).')
 
     commands["create_mask"] = subparsers.add_parser("create_mask", help="Save a binary mask per tomogram, derived from segmentation features.")
     commands["create_mask"].add_argument('--name', type=str, required=True, help='Mask name. Output files: <output-dir>/<tomo>__<name>.mrc.')
@@ -73,7 +75,7 @@ def main():
     commands["create_mask"].add_argument('--output-dir', type=str, default=None, help='Output directory (default: masks).')
     commands["create_mask"].add_argument('--dust', type=float, default=0.0, help='Dust removal on the final assembled mask (Å³ minimum component size, or negative N = keep N largest components).')
     commands["create_mask"].add_argument('--subset', type=str, default=None, help='Restrict processing to a subset of tomograms. Accepts either the name of a Pom subset (pom/subsets/<name>.txt) or a single tomogram name (without .mrc). If a subset file with that name exists it wins; otherwise treated as a single tomogram. If omitted, processes all tomograms found in tomogram/segmentation sources.')
-    commands["create_mask"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: min(cpu_count, 16)).')
+    commands["create_mask"].add_argument('--workers', type=int, default=None, help='Number of parallel workers (default: number of available CPUs, at most 16)).')
     commands["create_mask"].add_argument('--overwrite', action='store_true', help='Overwrite existing mask files.')
 
     args = parser.parse_args()
@@ -93,9 +95,9 @@ def main():
                 exit()
             tools.summarize_star(args.starfile, tomo_col=args.tomo_column, column_name=args.column_name, substitutions=args.substitutions, overwrite=args.overwrite)
         else:
-            tools.summarize(args.overwrite, args.feature)
+            tools.summarize(args.overwrite, args.feature, workers=args.workers)
     elif args.command == 'projections':
-        tools.projections(args.overwrite)
+        tools.projections(args.overwrite, workers=args.workers)
     elif args.command == 'render':
         if not args.overwrite:
             print("To update existing images, remember to include the flag `--overwrite`.")
